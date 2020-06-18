@@ -11,7 +11,7 @@ bin           = @["recorder_bot"]
 
 # Dependencies
 
-requires "nim >= 1.2.0", "toxcore >= 0.2.0", "opusenc", "ulid"
+requires "nim >= 1.2.0", "toxcore >= 0.3.1", "opusenc", "ulid"
 
 import distros
 if detectOs(NixOS):
