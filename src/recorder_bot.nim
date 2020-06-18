@@ -1,6 +1,6 @@
-import toxcore, toxcore/av, opusenc
+import toxcore, toxcore/av, toxcore/bootstrap, opusenc, ulid
 
-import std/asyncdispatch, std/asyncfile, std/json, std/os, std/strutils,
+import std/asyncdispatch, std/asyncfile, std/os, std/random, std/strutils,
     std/tables, std/times, std/uri
 
 {.passL: "-lcrypto".}
@@ -9,16 +9,10 @@ const
   readmeText = readFile "README.md"
 
 proc saveFileName(): string =
-  getEnv("TOX_DATA_FILE", "recorder.toxdata")
-
-proc iconFilename(): string =
-  getEnv("TOX_AVATAR_FILE", "avatar.png")
+  getEnv("TOX_DATA_FILE", "tox_save.tox")
 
 proc conferenceTitle(): string =
   getEnv("TOX_CONFERENCE_TITLE", "Recorder group")
-
-proc recordingsDir(): string =
-  getEnv("TOX_RECORDINGS_DIR", ".")
 
 iterator adminIds(): Address =
   let admins = getEnv("TOX_ADMIN_ID", "DF0AC9107E0A30E7201C6832B017AC836FBD1EDAC390EE99B68625D73C3FD929FB47F1872CA4")
@@ -26,23 +20,14 @@ iterator adminIds(): Address =
     yield admin.toAddress
 
 type
-  FriendState = ref object
+  Recording = ref object
     comments: OggOpusComments
     encoder: OggOpusEnc
+    path: string
 
   Bot = ref object
     core: Tox
     av: ToxAv
-    state: Table[Friend, FriendState]
-
-proc bootstrap(bot: Bot) =
-  const servers = [
-    ("::1",
-      "5533D825BA28D2D0A4F8CF1205EC7E7A506994081B52595DFE112C6A4AC14668".toPublicKey
-    )
-  ]
-  for host, key in servers.items:
-    bot.core.bootstrap(host, key)
 
 proc addAdmin(bot: Bot; id: Address) =
   try:
@@ -51,16 +36,23 @@ proc addAdmin(bot: Bot; id: Address) =
   except ToxError:
     discard
 
+proc avatarPath(bot: Bot): string =
+  getEnv("TOX_AVATAR_FILE", "avatars/self.png")
+
 proc sendAvatar(bot: Bot; friend: Friend) =
-  let path = iconFilename()
+  let path = bot.avatarPath()
   if existsFile path:
-    discard bot.core.send(
-      friend, TOX_FILE_KIND_AVATAR.uint32,
-      path.getFileSize, path)
+    let size = path.getFileSize
+    if 65536 < size:
+      echo "Error: ", path, " is larger than 64KiB"
+    else:
+      discard bot.core.send(
+        friend, TOX_FILE_KIND_AVATAR.uint32,
+        path.getFileSize, path)
 
 proc sendAvatarChunk(bot: Bot; friend: Friend; file: FileTransfer; pos: uint64;
     size: int) {.async.} =
-  let iconFile = openAsync(iconFilename(), fmRead)
+  let iconFile = openAsync(bot.avatarPath(), fmRead)
   iconFile.setFilePos(pos.int64);
   let chunk = await iconFile.read(size)
   close iconFile
@@ -72,36 +64,70 @@ proc updateAvatar(bot: Bot) =
       bot.sendAvatar(friend)
 
 type Command = enum
-  help, invite, readme, revoke
+  help, invite, readme, newspam, revoke
 
 proc updateStatus(bot: Bot) {.async.} =
   discard
 
-proc closeState(bot: Bot; friend: Friend) =
-  if bot.state.hasKey friend:
-    let state = bot.state[friend]
-    bot.state.del friend
-    drain state.encoder
-    destroy state.encoder
-    destroy state.comments
+proc initAudioRecording(bot: Bot; friend: Friend): Recording {.gcsafe.} =
+  let ulid = ulid()
+  result = Recording(
+    comments: newComments(),
+    path: getEnv("TOX_RECORDINGS_DIR", ".") / ulid & ".opus")
+  result.comments.add("DATE", now().format("yyyy-MM-dd HH:mm"))
+  result.comments.add("ULID", ulid)
+  result.comments.add("TOX_FRIEND", bot.core.name(friend))
+  result.comments.add("TOX_PUBLIC_KEY", $bot.core.publicKey(friend))
+  result.comments.add("TOX_STATUS", $bot.core.statusMessage(friend))
+  result.encoder = encoderCreateFile(result.path, result.comments, 48000, 2)
+
+proc firstWord(msg: string): string =
+  var words = msg.split(' ')
+  words[0].normalize
 
 proc setup(bot: Bot) =
   addTimer(20*1000, oneshot = false) do (fd: AsyncFD) -> bool:
     asyncCheck updateStatus(bot)
 
+  var
+    friendRecordings = initTable[Friend, Recording]()
+
   let conference = bot.core.newConference()
   `title=`(bot.core, conference, conferenceTitle())
 
+  proc closeRecording(friend: Friend) =
+    var rec: Recording
+    if friendRecordings.pop(friend, rec):
+      drain rec.encoder
+      destroy rec.encoder
+      destroy rec.comments
+      discard bot.core.send(friend,
+        "Finalized " & rec.path,
+        TOX_MESSAGE_TYPE_ACTION)
+
+  bot.core.onSelfConnectionStatus do (status: Connection):
+    case status
+    of TOX_CONNECTION_NONE:
+      echo("Disconnected from Tox network")
+    of TOX_CONNECTION_TCP:
+      echo("Acquired TCP connection to Tox network")
+    of TOX_CONNECTION_UDP:
+      echo("Acquired UDP connection to Tox network")
+
   bot.core.onFriendConnectionStatus do (friend: Friend; status: Connection):
     if status == TOX_CONNECTION_NONE:
-      bot.closeState(friend)
+      closeRecording(friend)
     else:
       bot.core.invite(friend, conference)
       bot.sendAvatar(friend)
 
+  bot.core.onFriendRequest do (key: PublicKey; msg: string):
+    echo key, ": ", msg
+    discard bot.core.addFriendNoRequest(key)
+
   bot.core.onFriendMessage do (f: Friend; msg: string; kind: MessageType):
-    proc reply(msg: string) =
-      discard bot.core.send(f, msg)
+    proc reply(msg: string, kind = TOX_MESSAGE_TYPE_NORMAL) =
+      discard bot.core.send(f, msg, kind)
     try:
       var words = msg.split(' ')
       if words.len < 1:
@@ -126,19 +152,38 @@ proc setup(bot: Bot) =
             reply(resp)
           of invite:
             reply """Invite a new user to the bot."""
+          of newspam:
+            reply(
+              """Rotate bot toxid. """ &
+              """This prevents any previously generated toxid to be used """ &
+              """ to add new friends to the bot.""")
           of readme:
             reply """Return bot README"""
           of revoke:
             reply """Remove yourself from the bot roster."""
 
       of invite:
-        for id in words[1..words.high]:
-          try:
-            discard bot.core.addFriend(id.toAddress,
-                "You have been invited to the $1 by $2 ($3)" % [bot.core.name,
-                bot.core.name(f), $bot.core.publicKey(f)])
-          except:
-            reply(getCurrentExceptionMsg())
+        if words[1] == "":
+          echo bot.core.name, " is at ", bot.core.address
+          reply($bot.core.address &
+            " - pass this toxid to the friend you wish to invite."&
+            " Use the `newspam` command to revoke this toxid."
+            )
+        else:
+          for id in words[1..words.high]:
+            try:
+              discard bot.core.addFriend(id.toAddress,
+                  "You have been invited to the $1 by $2 ($3)" % [bot.core.name,
+                  bot.core.name(f), $bot.core.publicKey(f)])
+              reply("Invited " & id, TOX_MESSAGE_TYPE_ACTION)
+            except:
+              reply(getCurrentExceptionMsg())
+
+      of newspam:
+        let now = getTime()
+        var rng = initRand(bot.core.noSpam.int64 xor now.toUnix xor now.nanosecond)
+        bot.core.noSpam = (NoSpam)rng.rand(NoSpam.high.int)
+        reply("Toxid rotated to " & $bot.core.address, TOX_MESSAGE_TYPE_ACTION)
 
       of readme:
         reply readmeText
@@ -156,35 +201,26 @@ proc setup(bot: Bot) =
       asyncCheck bot.sendAvatarChunk(friend, file, pos, size)
 
   bot.av.onCall do (friend: Friend; audioEnabled, videoEnabled: bool):
-    proc reply(msg: string) =
-      discard bot.core.send(friend, msg)
-    if audioEnabled: reply "calling with audio"
-    if videoEnabled: reply "calling with video"
-    assert(not bot.state.hasKey(friend))
+    assert(not friendRecordings.hasKey(friend))
     if bot.av.answer(friend):
-      let
-        date = now().format("yyyy-MM-dd-hh:mm:ss")
-        path = recordingsDir() / date & ".opus"
-        state = FriendState(comments: newComments())
-      bot.state[friend] = state
-      state.comments.add("DATE", date)
-      state.comments.add("TOX_FRIEND", bot.core.name(friend))
-      state.comments.add("TOX_PUBLIC_KEY", $bot.core.publicKey(friend))
-      state.comments.add("TOX_STATUS", $bot.core.statusMessage(friend))
-      state.encoder = encoderCreateFile(path, state.comments, 48000, 2)
-      reply("recording to file " & path)
+      friendRecordings[friend] = initAudioRecording(bot, friend)
+      discard bot.core.send(friend,
+        "Recording to file " & friendRecordings[friend].path,
+        TOX_MESSAGE_TYPE_ACTION)
 
   bot.av.onCallState do (friend: Friend; state: uint32):
     if state == FRIEND_CALL_STATE_FINISHED:
-      bot.closeState(friend)
+      closeRecording(friend)
 
   bot.av.onAudioReceiveFrame do (
       friend: Friend; pcm: Samples; sampleCount: int;
-      channels: uint8; samplingRate: uint32):
+      channels: uint8; sampleRate: uint32):
     doAssert(channels == 2)
-    doAssert(samplingRate == 48000)
-    let state = bot.state[friend]
-    state.encoder.write(addr pcm[0], sampleCount)
+    doAssert(sampleRate == 48000)
+    let rec = friendRecordings[friend]
+    rec.encoder.write(addr pcm[0], sampleCount)
+
+    doAssert(channels == 2)
 
 proc newBot(): Bot =
   let core = newTox do (opts: Options):
@@ -196,15 +232,21 @@ proc newBot(): Bot =
 
   let av = newAv(core)
 
-  result = Bot(core: core, av: av, state: initTable[Friend, FriendState]())
+  result = Bot(core: core, av: av)
   result.core.name = getEnv("TOX_NAME", "Recorder Bot")
   result.core.statusMessage = getEnv("TOX_STATUS", "")
 
   result.setup()
 
   for id in adminIds(): result.addAdmin(id)
-  result.bootstrap()
+
+  asyncCheck result.core.bootstrapFromSpof()
+
   echo result.core.name, " is at ", result.core.address
+
+  let ap = result.avatarPath()
+  if not fileExists(ap):
+    echo "Warning: no avatar found at ", ap
 
 proc main() =
   let bot = newBot()
