@@ -15,7 +15,9 @@ proc conferenceTitle(): string =
   getEnv("TOX_CONFERENCE_TITLE", "Recorder group")
 
 iterator adminIds(): Address =
-  let admins = getEnv("TOX_ADMIN_ID", "DF0AC9107E0A30E7201C6832B017AC836FBD1EDAC390EE99B68625D73C3FD929FB47F1872CA4")
+  let admins = getEnv("TOX_ADMIN_ID")
+  if admins == "":
+    echo "Warning: no admins declared via $TOX_ADMIN_ID"
   for admin in splitWhitespace admins:
     yield admin.toAddress
 
