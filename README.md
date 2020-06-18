@@ -20,4 +20,4 @@ The following environmental variables affect the bot behavior:
  * TOX_NAME - Display name of bot
  * TOX_RECORDINGS_DIR - Directory to write recordings into
  * TOX_STATUS - Status message of bot
-
+ * TOX_RECORDING_URL - URL sent back to clients, i.e `https://foo/$#.opus`

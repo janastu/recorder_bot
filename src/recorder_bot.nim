@@ -26,6 +26,7 @@ type
     comments: OggOpusComments
     encoder: OggOpusEnc
     path: string
+    id: string
 
   Bot = ref object
     core: Tox
@@ -72,16 +73,25 @@ proc updateStatus(bot: Bot) {.async.} =
   discard
 
 proc initAudioRecording(bot: Bot; friend: Friend): Recording {.gcsafe.} =
-  let ulid = ulid()
+  let
+    id = ulid()
   result = Recording(
     comments: newComments(),
-    path: getEnv("TOX_RECORDINGS_DIR", ".") / ulid & ".opus")
+    id: id,
+    path: getEnv("TOX_RECORDINGS_DIR", ".") / id & ".opus")
   result.comments.add("DATE", now().format("yyyy-MM-dd HH:mm"))
-  result.comments.add("ULID", ulid)
+  result.comments.add("ULID", id)
   result.comments.add("TOX_FRIEND", bot.core.name(friend))
   result.comments.add("TOX_PUBLIC_KEY", $bot.core.publicKey(friend))
   result.comments.add("TOX_STATUS", $bot.core.statusMessage(friend))
   result.encoder = encoderCreateFile(result.path, result.comments, 48000, 2)
+
+proc recordingUrl(rec: Recording): string =
+  let format = getEnv("TOX_RECORDING_URL")
+  if format == "":
+    rec.path
+  else:
+    format % rec.id
 
 proc firstWord(msg: string): string =
   var words = msg.split(' ')
@@ -104,7 +114,7 @@ proc setup(bot: Bot) =
       destroy rec.encoder
       destroy rec.comments
       discard bot.core.send(friend,
-        "Finalized " & rec.path,
+        "finalized " & recordingUrl(rec),
         TOX_MESSAGE_TYPE_ACTION)
 
   bot.core.onSelfConnectionStatus do (status: Connection):
@@ -177,7 +187,7 @@ proc setup(bot: Bot) =
               discard bot.core.addFriend(id.toAddress,
                   "You have been invited to the $1 by $2 ($3)" % [bot.core.name,
                   bot.core.name(f), $bot.core.publicKey(f)])
-              reply("Invited " & id, TOX_MESSAGE_TYPE_ACTION)
+              reply("invited " & id, TOX_MESSAGE_TYPE_ACTION)
             except:
               reply(getCurrentExceptionMsg())
 
@@ -185,7 +195,7 @@ proc setup(bot: Bot) =
         let now = getTime()
         var rng = initRand(bot.core.noSpam.int64 xor now.toUnix xor now.nanosecond)
         bot.core.noSpam = (NoSpam)rng.rand(NoSpam.high.int)
-        reply("Toxid rotated to " & $bot.core.address, TOX_MESSAGE_TYPE_ACTION)
+        reply("rotated toxid to " & $bot.core.address, TOX_MESSAGE_TYPE_ACTION)
 
       of readme:
         reply readmeText
@@ -207,7 +217,7 @@ proc setup(bot: Bot) =
     if bot.av.answer(friend):
       friendRecordings[friend] = initAudioRecording(bot, friend)
       discard bot.core.send(friend,
-        "Recording to file " & friendRecordings[friend].path,
+        "records to file " & recordingUrl(friendRecordings[friend]),
         TOX_MESSAGE_TYPE_ACTION)
 
   bot.av.onCallState do (friend: Friend; state: uint32):
