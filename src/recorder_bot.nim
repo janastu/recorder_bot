@@ -212,6 +212,12 @@ proc setup(bot: Bot) =
     if size != 0:
       asyncCheck bot.sendAvatarChunk(friend, file, pos, size)
 
+  bot.core.onConferenceInvite do (friend: Friend; kind: ConferenceType; cookie: string):
+    discard bot.core.join(friend, cookie)
+
+  bot.core.onConferenceConnected do (conf: Conference):
+    echo "Connected to conference \"", bot.core.title(conf), "\""
+
   bot.av.onCall do (friend: Friend; audioEnabled, videoEnabled: bool):
     assert(not friendRecordings.hasKey(friend))
     if bot.av.answer(friend):
